@@ -26,8 +26,8 @@ def get_combined_label(sample):
     weather = getattr(sample.weather, "label", None)
     timeofday = getattr(sample.timeofday, "label", None)
 
-    weather_ok = weather in CONFIG["ATTRIBUTES_TO_FILTER"]['weather']
-    time_ok = timeofday in CONFIG["ATTRIBUTES_TO_FILTER"]['timeofday']
+    weather_ok = weather in CONFIG["ATTRIBUTES_TO_FILTER"]["weather"]
+    time_ok = timeofday in CONFIG["ATTRIBUTES_TO_FILTER"]["timeofday"]
 
     if weather_ok or time_ok:
         parts = []
@@ -40,7 +40,7 @@ def get_combined_label(sample):
 
 
 def export_filtered_images(view, export_dir):
-    """按标签导出图像（不进行 resize）"""
+    """按标签导出图像"""
     groups = defaultdict(list)
 
     for sample in view:
@@ -63,9 +63,9 @@ def export_filtered_images(view, export_dir):
                 img.save(save_path)
                 total_exported += 1
             except Exception as e:
-                print(f"❌ 图像处理失败: {filepath}，错误: {e}")
+                print(f"图像处理失败: {filepath}，错误: {e}")
 
-        print(f"✅ 已导出 {len(filepaths)} 张 '{label}' 图像至: {label_dir}")
+        print(f"已导出 {len(filepaths)} 张 '{label}' 图像至: {label_dir}")
 
     return total_exported
 
@@ -73,7 +73,7 @@ def export_filtered_images(view, export_dir):
 def main():
     print("--- 基于 FiftyOne 的 BDD100K 场景筛选器 ---")
 
-    for split in CONFIG['SPLITS']:
+    for split in CONFIG["SPLITS"]:
         dataset_name = f"{CONFIG['DATASET_NAME_PREFIX']}-{split}"
         print(f"\n--- 正在处理 {split.upper()} 数据集 ---")
 
@@ -81,26 +81,30 @@ def main():
             fo.delete_dataset(dataset_name)
 
         try:
-            print(f"📦 加载 {dataset_name} 数据集...")
+            print(f"加载 {dataset_name} 数据集...")
             dataset = foz.load_zoo_dataset(
                 "bdd100k",
                 split=split,
                 dataset_name=dataset_name,
                 source_dir=CONFIG["BDD100K_SOURCE_DIR"],
-                max_samples=1000
+                max_samples=1000,
             )
         except Exception as e:
-            print(f"❌ 加载失败: {e}")
+            print(f"加载失败: {e}")
             continue
 
-        print(f"✅ 数据集加载成功，共 {len(dataset)} 张图像")
+        print(f"数据集加载成功，共 {len(dataset)} 张图像")
 
         # 属性筛选
-        weather_filter = F("weather.label").is_in(CONFIG["ATTRIBUTES_TO_FILTER"]['weather'])
-        time_filter = F("timeofday.label").is_in(CONFIG["ATTRIBUTES_TO_FILTER"]['timeofday'])
+        weather_filter = F("weather.label").is_in(
+            CONFIG["ATTRIBUTES_TO_FILTER"]["weather"]
+        )
+        time_filter = F("timeofday.label").is_in(
+            CONFIG["ATTRIBUTES_TO_FILTER"]["timeofday"]
+        )
         view = dataset.match(F.any([weather_filter, time_filter]))
 
-        print(f"🔍 属性筛选后剩余 {len(view)} 张图像")
+        print(f"属性筛选后剩余 {len(view)} 张图像")
 
         if len(view) == 0:
             continue
@@ -110,22 +114,21 @@ def main():
         os.makedirs(split_export_dir, exist_ok=True)
 
         exported_count = export_filtered_images(view, split_export_dir)
-        print(f"📦 共导出 {exported_count} 张图像到 {split_export_dir}")
+        print(f"共导出 {exported_count} 张图像到 {split_export_dir}")
 
-    print(f"\n🎉 全部完成！图像已保存在：'{CONFIG['EXPORT_DIR']}'")
+    print(f"全部完成！图像已保存在：'{CONFIG['EXPORT_DIR']}'")
 
 
 if __name__ == "__main__":
     # --- 配置区 ---
     CONFIG = {
         "ATTRIBUTES_TO_FILTER": {
-            'weather': ['rainy', 'snowy', 'foggy'],
-            'timeofday': ['night', 'dawn/dusk']
+            "weather": ["rainy", "snowy", "foggy"],
+            "timeofday": ["night", "dawn/dusk"],
         },
         "EXPORT_DIR": "/Users/cooper/Data/PublicDatasets/bdd100k_filtered_images3",
         "DATASET_NAME_PREFIX": "bdd100k_filtered",
-        "SPLITS": ['train', 'validation'],
-        "BDD100K_SOURCE_DIR": "/Users/cooper/Data/PublicDatasets/bdd100k", 
-        "LAUNCH_APP": False,
+        "SPLITS": ["train", "validation"],
+        "BDD100K_SOURCE_DIR": "/Users/cooper/Data/PublicDatasets/bdd100k",
     }
     main()

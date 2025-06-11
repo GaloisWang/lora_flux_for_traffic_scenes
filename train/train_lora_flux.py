@@ -60,8 +60,7 @@ class TrainParametersConfig:
     lora_alpha: int = 16
     pretrained_model_path: str = "black-forest-labs/FLUX.1-dev"
     resolution: int = 512
-    # 移除use_amp参数，Accelerator会自动管理混合精度
-    mixed_precision: str = "fp16"  # 可以是 "no", "fp16", "bf16"
+    mixed_precision: str = "fp16"
     seed: int = 1337
     dataloader_num_workers: int = 2
     max_grad_norm: float = 1.0
@@ -105,7 +104,6 @@ def encode_prompt(text_encoders, input_ids_one, input_ids_two, device=None):
     dtype = t5_prompt_embed.dtype
     text_ids = torch.zeros(t5_prompt_embed.shape[1], 3).to(device=device, dtype=dtype)
     return t5_prompt_embed, pooled_prompt_embeds_one, text_ids
-
 
 
 class Text2ImageDataset(torch.utils.data.Dataset):
@@ -225,7 +223,7 @@ def main(train_configs):
     vae = vae.to(accelerator.device)
 
     logger.info("加载flux transformer...")
-    mmdit = FluxTransformer2DModel.from_pretrained(
+    flux_transformer = FluxTransformer2DModel.from_pretrained(
         train_configs.pretrained_model_path,
         subfolder="transformer",
         torch_dtype=weight_dtype,
@@ -249,18 +247,11 @@ def main(train_configs):
         device_map="auto",
     )
 
-    # 将文本编码器移动到设备并设置为评估模式
-    # text_encoder_one = text_encoder_one.to(accelerator.device)
-    # text_encoder_two = text_encoder_two.to(accelerator.device)
-
-    # 冻结原始模型参数
-    mmdit.requires_grad_(False)
+    flux_transformer.requires_grad_(False)
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
-    # VAE 设置为评估模式
     vae.eval()
-    # 设置文本编码器为评估模式
     text_encoder_one.eval()
     text_encoder_two.eval()
 
@@ -284,21 +275,20 @@ def main(train_configs):
             "ff_context.net.2",
         ],
     )
-    mmdit = get_peft_model(mmdit, lora_config)
+    flux_transformer = get_peft_model(flux_transformer, lora_config)
 
     if accelerator.is_main_process:
-        mmdit.print_trainable_parameters()
+        flux_transformer.print_trainable_parameters()
 
     # 设置优化器
     optimizer = torch.optim.AdamW(
-        mmdit.parameters(),
+        flux_transformer.parameters(),
         lr=train_configs.learning_rate,
         weight_decay=1e-04,
         eps=1e-08,
         betas=(0.9, 0.999),
     )
 
-    # 创建数据集和数据加载器
     dataset = Text2ImageDataset(
         train_configs.image_dir,
         train_configs.captions_dir,
@@ -326,20 +316,18 @@ def main(train_configs):
             text_ids = text_ids.to(accelerator.device)
         return prompt_embeds, pooled_prompt_embeds, text_ids
 
-    # 计算训练步数
     num_update_steps_per_epoch = math.ceil(
         len(dataloader) / train_configs.gradient_accumulation_steps
     )
     max_train_steps = train_configs.epochs * num_update_steps_per_epoch
 
-    # 使用 Accelerator 准备模型、优化器和数据加载器
-    mmdit, optimizer, dataloader = accelerator.prepare(mmdit, optimizer, dataloader)
+    flux_transformer, optimizer, dataloader = accelerator.prepare(
+        flux_transformer, optimizer, dataloader
+    )
 
-    # 初始化跟踪器
     if accelerator.is_main_process:
         accelerator.init_trackers("flux_lora_training")
 
-    # 训练信息日志
     logger.info("***** 训练信息 *****")
     logger.info(f"  数据集样本数 = {len(dataset)}")
     logger.info(f"  训练轮数 = {train_configs.epochs}")
@@ -374,7 +362,7 @@ def main(train_configs):
 
     # 训练循环
     for epoch in range(first_epoch, train_configs.epochs):
-        mmdit.train()
+        flux_transformer.train()
         epoch_loss = 0.0
 
         progress_bar = tqdm(
@@ -384,21 +372,17 @@ def main(train_configs):
         )
 
         for step, batch in enumerate(progress_bar):
-            with accelerator.accumulate(mmdit):
-                # 准备输入数据
+            with accelerator.accumulate(flux_transformer):
                 pixel_values = batch["pixel_values"].to(dtype=torch.float32)
                 input_ids_one = batch["input_ids_one"]
                 input_ids_two = batch["input_ids_two"]
 
-                # 计算文本embeddings
                 prompt_embeds, pooled_prompt_embeds, text_ids = compute_text_embeddings(
                     text_encoders=[text_encoder_one, text_encoder_two],
                     input_ids_one=input_ids_one,
                     input_ids_two=input_ids_two,
                     device=accelerator.device,
                 )
-
-                # VAE编码
                 with torch.no_grad():
                     model_input = vae.encode(pixel_values).latent_dist.sample()
                     model_input = (
@@ -416,11 +400,8 @@ def main(train_configs):
                     weight_dtype,
                 )
 
-                # 生成噪声和时间步
                 noise = torch.randn_like(model_input)
                 bsz = model_input.shape[0]
-                # Sample a random timestep for each image
-                # for weighting schemes where we sample timesteps non-uniformly
                 u = compute_density_for_timestep_sampling(
                     weighting_scheme="logit_normal",
                     batch_size=bsz,
@@ -432,9 +413,6 @@ def main(train_configs):
                 timesteps = noise_scheduler_copy.timesteps[indices].to(
                     device=model_input.device
                 )
-
-                # Add noise according to flow matching.
-                # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(
                     timesteps, n_dim=model_input.ndim, dtype=model_input.dtype
                 )
@@ -451,11 +429,10 @@ def main(train_configs):
                 guidance = torch.tensor([3.5], device=accelerator.device)
                 guidance = guidance.expand(model_input.shape[0])
 
-                # 前向传播
-                model_pred = mmdit(
+                model_pred = flux_transformer(
                     hidden_states=packed_noisy_model_input,
                     timestep=timesteps / 1000,
-                    guidance=guidance, 
+                    guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
                     txt_ids=text_ids,
@@ -474,7 +451,6 @@ def main(train_configs):
                 )
                 target = noise - model_input
 
-                # 计算损失
                 loss = torch.mean(
                     (
                         weighting.float() * (model_pred.float() - target.float()) ** 2
@@ -483,24 +459,20 @@ def main(train_configs):
                 )
                 loss = loss.mean()
 
-                # 检查损失是否为NaN
                 if torch.isnan(loss):
                     logger.warning("损失为NaN,跳过此批次")
                     continue
 
-                # 反向传播
                 accelerator.backward(loss)
 
-                # 梯度裁剪
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(
-                        mmdit.parameters(), train_configs.max_grad_norm
+                        flux_transformer.parameters(), train_configs.max_grad_norm
                     )
 
                 optimizer.step()
                 optimizer.zero_grad()
 
-            # 记录日志
             logs = {"train_loss": loss.detach().item()}
             if accelerator.sync_gradients:
                 global_step += 1
@@ -509,7 +481,6 @@ def main(train_configs):
             epoch_loss += loss.detach().item()
             accelerator.log(logs, step=global_step)
 
-            # 更新进度条
             progress_bar.set_postfix(
                 {
                     "loss": f"{loss.detach().item():.4f}",
@@ -518,19 +489,16 @@ def main(train_configs):
                 }
             )
 
-        # 计算平均损失并记录
         avg_loss = epoch_loss / len(dataloader)
         accelerator.log({"train_epoch_loss": avg_loss}, step=epoch)
         logger.info(f"Epoch {epoch+1} 完成. 平均损失: {avg_loss:.4f}")
 
-        # 保存检查点
         if accelerator.is_main_process and (
             (epoch + 1) % train_configs.save_every_n_epochs == 0
             or epoch == train_configs.epochs - 1
         ):
-            # 获取未包装的模型以保存LoRA权重
-            unwrapped_mmdit = accelerator.unwrap_model(mmdit)
-            lora_state_dict = get_peft_model_state_dict(unwrapped_mmdit)
+            unwrapped_flux_transformer = accelerator.unwrap_model(flux_transformer)
+            lora_state_dict = get_peft_model_state_dict(unwrapped_flux_transformer)
             cleaned_state_dict = {}
             for key, value in lora_state_dict.items():
                 if key.startswith("base_model.model."):
@@ -551,16 +519,14 @@ def main(train_configs):
             )
             logger.info(f"LoRA 权重已保存至: {lora_save_path}")
 
-        # 内存清理
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
         accelerator.wait_for_everyone()
 
-    # 最终保存
     if accelerator.is_main_process:
-        unwrapped_mmdit = accelerator.unwrap_model(mmdit)
-        final_lora_state_dict = get_peft_model_state_dict(unwrapped_mmdit)
+        unwrapped_flux_transformer = accelerator.unwrap_model(flux_transformer)
+        final_lora_state_dict = get_peft_model_state_dict(unwrapped_flux_transformer)
         cleaned_state_dict = {}
         for key, value in final_lora_state_dict.items():
             if key.startswith("base_model.model."):
@@ -568,16 +534,13 @@ def main(train_configs):
                 cleaned_state_dict[new_key] = value
             else:
                 cleaned_state_dict[key] = value
-
         final_lora_save_path = os.path.join(train_configs.output_dir, "lora_final")
         os.makedirs(final_lora_save_path, exist_ok=True)
-
         FluxPipeline.save_lora_weights(
             save_directory=final_lora_save_path,
             transformer_lora_layers=cleaned_state_dict,
             text_encoder_lora_layers=None,
         )
-
         current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         logger.info(
             f"训练完成. [{current_time}] LoRA 权重已保存至: {final_lora_save_path}"
